@@ -1,0 +1,204 @@
+"""Application Context Helpers
+
+Utilities for working with global application context and validation.
+
+v0.49.0: Extracted from main.py for better modularity (GM-45)
+v0.50.0: Added get_dependencies() for DI container access (GM-46)
+
+IMPORTANT: HYBRID ACCESS PATTERN (Transitional)
+================================================
+
+This module supports TWO ways to access services:
+
+1. **Dependency Injection (RECOMMENDED for tools)**:
+   ```python
+   @mcp.tool()
+   async def my_tool(ctx: Context):
+       deps = ctx.request_context.lifespan_context.dependencies
+       gns3 = deps.get(IGns3Client)
+       console = deps.get(IConsoleManager)
+   ```
+
+   Advantages:
+   - Type-safe interface-based access
+   - Easy to mock for unit tests
+   - Explicit dependencies
+   - Thread-safe
+   - Follows SOLID principles
+
+2. **Global State (LEGACY - only for resources)**:
+   ```python
+   def resource_callback():
+       app = get_app()
+       gns3 = app.gns3
+       console = app.console
+   ```
+
+   Why still needed:
+   - FastMCP resources don't receive Context parameter
+   - Resource callbacks lack access to request context
+   - Global state is acceptable for resources until FastMCP adds context support
+
+Migration Strategy:
+-------------------
+- NEW CODE: Always use DI (pattern #1)
+- TOOLS: Migrate to DI when touching existing code
+- RESOURCES: Keep global state until FastMCP supports context in resources
+- TARGET: Pure DI architecture (eliminate global state entirely)
+
+See docs/MIGRATION_GM-46.md for detailed migration guide.
+See docs/DI_USAGE_GUIDE.md for usage patterns and examples.
+"""
+
+import json
+import logging
+from typing import TYPE_CHECKING
+
+from di_container import Dependencies
+from models import ErrorResponse
+
+if TYPE_CHECKING:
+    from interfaces import IAppContext
+
+logger = logging.getLogger(__name__)
+
+# Global app context for static resources (set during lifespan)
+_app: "IAppContext | None" = None
+
+
+def get_app() -> "IAppContext":
+    """Get global app context (for resources that don't have Context)
+
+    Raises:
+        RuntimeError: If application not initialized
+
+    Returns:
+        Application context
+    """
+    if _app is None:
+        raise RuntimeError("Application not initialized")
+    return _app
+
+
+def set_app(app: "IAppContext") -> None:
+    """Set global app context
+
+    Called during application startup.
+
+    Args:
+        app: Application context to set
+    """
+    global _app
+    _app = app
+
+
+def clear_app() -> None:
+    """Clear global app context
+
+    Called during application shutdown.
+    """
+    global _app
+    _app = None
+
+
+def get_dependencies() -> Dependencies:
+    """Get DI container from global app context
+
+    v0.50.0: New helper for accessing DI container (GM-46)
+
+    Raises:
+        RuntimeError: If application not initialized
+
+    Returns:
+        Dependencies container
+
+    Example:
+        ```python
+        # In a tool/resource without FastMCP context
+        deps = get_dependencies()
+        gns3 = deps.get(IGns3Client)
+        ```
+    """
+    app = get_app()
+    return app.dependencies
+
+
+async def validate_current_project(app: "IAppContext") -> str | None:
+    """Validate that current project is still open, with auto-connect to opened projects
+
+    If no project is connected but one is opened in GNS3, automatically connects to it.
+    This provides seamless UX when projects are opened via GNS3 GUI.
+
+    Args:
+        app: Application context
+
+    Returns:
+        Error message (JSON string) if invalid, None if valid
+    """
+    try:
+        # Get project list directly from API
+        projects = await app.gns3.get_projects()
+
+        # If no project connected, try to auto-connect to opened project
+        if not app.current_project_id:
+            opened = [p for p in projects if p.get("status") == "opened"]
+
+            if not opened:
+                return json.dumps(
+                    ErrorResponse(
+                        error="No project opened in GNS3",
+                        details="No projects are currently opened. Open a project in GNS3 or use open_project()",
+                        suggested_action="Open a project in GNS3 GUI, or call list_projects() then open_project(project_name)",
+                    ).model_dump(),
+                    indent=2,
+                )
+
+            # Auto-connect to the first opened project
+            app.current_project_id = opened[0]["project_id"]
+            logger.info(
+                f"Auto-connected to opened project: {opened[0]['name']} ({opened[0]['project_id']})"
+            )
+
+            if len(opened) > 1:
+                logger.warning(
+                    f"Multiple projects opened ({len(opened)}), connected to: {opened[0]['name']}"
+                )
+
+            return None  # Successfully auto-connected
+
+        # Validate that connected project still exists and is opened
+        project = next((p for p in projects if p["project_id"] == app.current_project_id), None)
+
+        if not project:
+            app.current_project_id = None
+            return json.dumps(
+                ErrorResponse(
+                    error="Project no longer exists",
+                    details=f"Project ID {app.current_project_id} not found. Use list_projects() and open_project()",
+                    suggested_action="Call list_projects() to see current projects, then open_project(project_name)",
+                ).model_dump(),
+                indent=2,
+            )
+
+        if project["status"] != "opened":
+            app.current_project_id = None
+            return json.dumps(
+                ErrorResponse(
+                    error=f"Project is {project['status']}",
+                    details=f"Project '{project['name']}' is not open. Use open_project() to reopen",
+                    suggested_action=f"Call open_project('{project['name']}') to reopen this project",
+                ).model_dump(),
+                indent=2,
+            )
+
+        return None
+
+    except Exception as e:
+        return json.dumps(
+            ErrorResponse(
+                error="Failed to validate project",
+                details=str(e),
+                suggested_action="Check GNS3 server connection and project state",
+            ).model_dump(),
+            indent=2,
+        )

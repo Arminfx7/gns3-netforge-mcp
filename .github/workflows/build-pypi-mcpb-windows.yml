@@ -1,0 +1,208 @@
+name: Build Windows MCP Extension
+
+on:
+  workflow_dispatch:  # Manual trigger
+  push:
+    tags:
+      - 'v*'  # Trigger on version tags
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Download UV package manager
+        run: |
+          Write-Host "Downloading UV package manager for Windows..."
+          $uvUrl = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
+          $uvZip = "uv-windows.zip"
+          Invoke-WebRequest -Uri $uvUrl -OutFile $uvZip
+          Write-Host "Extracting UV binary..."
+          Expand-Archive -Path $uvZip -DestinationPath mcp-server -Force
+          Remove-Item $uvZip
+          Write-Host "UV binary downloaded successfully"
+          Get-Item mcp-server\uv.exe | Format-List
+
+      - name: Install build tools for PyPI
+        run: |
+          pip install build twine
+
+      - name: Copy source code for packaging
+        run: |
+          Write-Host "Copying gns3_mcp\ source code into mcp-server\ for .mcpb packaging..."
+          if (Test-Path mcp-server\gns3_mcp) {
+            Remove-Item -Path mcp-server\gns3_mcp -Recurse -Force
+          }
+          Copy-Item -Path gns3_mcp -Destination mcp-server\gns3_mcp -Recurse -Force
+          Write-Host "Source code copied successfully"
+
+      - name: Build MCP binary
+        run: |
+          cd mcp-server
+          npx @anthropic-ai/mcpb@1.1.2 pack
+
+      - name: Verify build output
+        run: |
+          if (!(Test-Path mcp-server\mcp-server.mcpb)) {
+            Write-Host "Error: mcp-server.mcpb was not created"
+            exit 1
+          }
+          Write-Host "Build successful:"
+          Get-Item mcp-server\mcp-server.mcpb | Format-List
+
+          # Verify UV binary is included (size should be ~22 MB with UV binary)
+          $SizeMB = [math]::Round((Get-Item mcp-server\mcp-server.mcpb).Length / 1MB)
+          if ($SizeMB -lt 20) {
+            Write-Host "ERROR: .mcpb size is ${SizeMB}M - UV binary likely missing!"
+            Write-Host "Expected size: ~22 MB (compressed, includes 58 MB UV binary)"
+            Write-Host "Actual size: $SizeMB MB"
+            exit 1
+          }
+          Write-Host "Size check passed: $SizeMB MB (UV binary included)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-server-windows
+          path: mcp-server\mcp-server.mcpb
+          retention-days: 30
+
+      - name: Extract version and check for tag
+        id: version
+        run: |
+          $manifest = Get-Content mcp-server\manifest.json | ConvertFrom-Json
+          $version = $manifest.version
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Version: $version"
+
+          # Check if current commit has a version tag
+          $tag = git describe --exact-match --tags HEAD 2>$null
+          if ($tag -match "^v") {
+            echo "is_tagged=true" >> $env:GITHUB_OUTPUT
+            Write-Host "This commit is tagged for release"
+          } else {
+            echo "is_tagged=false" >> $env:GITHUB_OUTPUT
+            Write-Host "This commit is not tagged"
+          }
+
+      - name: Build PyPI distributions
+        if: steps.version.outputs.is_tagged == 'true'
+        run: |
+          python -m build
+          Get-ChildItem dist\
+
+      - name: Publish to PyPI
+        if: steps.version.outputs.is_tagged == 'true'
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          python -m twine upload dist\*
+
+      - name: Create Release
+        if: steps.version.outputs.is_tagged == 'true'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            mcp-server/mcp-server.mcpb
+            dist/*.whl
+            dist/*.tar.gz
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Release ${{ steps.version.outputs.version }}
+          body: |
+            ## GNS3 MCP Server v${{ steps.version.outputs.version }}
+
+            ### 🚀 Quick Installation (Claude Code)
+
+            **Option 1: Using uvx (Recommended - Faster)**
+            ```powershell
+            claude mcp add --transport stdio gns3-mcp --env GNS3_HOST=localhost --env GNS3_PORT=80 --env GNS3_USER=admin --env GNS3_PASSWORD=your-password --scope user -- uvx gns3-mcp@latest
+            ```
+
+            Omit default parameters and it would be:
+            ```powershell
+            claude mcp add --transport stdio gns3-mcp --env GNS3_HOST=192.168.1.20 --env GNS3_PASSWORD=your-password --scope user -- uvx gns3-mcp@latest
+            ```
+
+            **Option 2: Using pip (Traditional)**
+            Step 1: Install package
+            ```powershell
+            pip install gns3-mcp
+            ```
+
+            Step 2: Add to Claude Code with credentials
+            ```powershell
+            claude mcp add --transport stdio gns3-mcp --env GNS3_HOST=localhost --env GNS3_PORT=80 --env GNS3_USER=admin --env GNS3_PASSWORD=your-password --scope user -- gns3-mcp
+            ```
+
+            **Claude Desktop:**
+            Download `mcp-server.mcpb` → double-click to install → configure credentials in settings.
+
+            **Cursor/Windsurf:**
+            See [full installation guide](https://github.com/${{ github.repository }}/blob/master/README.md#installation) for JSON configuration examples.
+
+            ### 🐳 Docker Deployment (NEW in v0.49.0)
+
+            **Quick Start with Docker Compose:**
+            - Download docker-compose.yml and .env.example:
+            ```bash
+            curl -O https://raw.githubusercontent.com/${{ github.repository }}/master/docker-compose.yml
+            curl -O https://raw.githubusercontent.com/${{ github.repository }}/master/.env.example
+            ```
+
+            - Configure credentials
+            ```bash
+            mv .env.example .env
+            ```
+            - Edit .env with your GNS3 server details
+
+            - Start stack (MCP server + SSH proxy)
+            ```bash
+            docker-compose up -d
+            ```
+
+            **Docker Run (MCP server only, SSH proxy in separate container):**
+            ```bash
+            docker run -d \
+              --name gns3-mcp \
+              -p 8000:8000 \
+              -e GNS3_HOST=192.168.1.20 \
+              -e GNS3_PORT=80 \
+              -e GNS3_USER=admin \
+              -e GNS3_PASSWORD=your-password \
+              chistokhinsv/gns3-mcp:${{ steps.version.outputs.version }}
+            ```
+
+            **Docker Hub:**
+            - Image: `chistokhinsv/gns3-mcp:${{ steps.version.outputs.version }}`
+            - Tags: `${{ steps.version.outputs.version }}`, `latest`
+            - Platforms: linux/amd64, linux/arm64
+            - [View on Docker Hub](https://hub.docker.com/r/chistokhinsv/gns3-mcp)
+
+            ### Changes
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/master/CHANGELOG.md) for details.
+
+            ### Platform
+            - **Supported:** Windows for Desktop Extension (MCPB with UV binary), Linux and macOS for uv/pip and docker installations.
+            - **Python:** 3.10-3.13
+            - Built on: windows-latest runner
+          draft: false
+          prerelease: false

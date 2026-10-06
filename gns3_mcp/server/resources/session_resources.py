@@ -1,0 +1,657 @@
+"""
+Session-related MCP Resources
+
+Handles resources for console and SSH sessions, including history and buffers.
+"""
+
+import json
+import os
+from typing import TYPE_CHECKING, Any, Dict, List
+
+import httpx
+from error_utils import create_error_response
+from models import ErrorCode
+from tabulate import tabulate
+
+if TYPE_CHECKING:
+    from interfaces import IAppContext
+
+
+# SSH Proxy API URL (same as ssh_tools.py)
+_gns3_host = os.getenv("GNS3_HOST", "localhost")
+SSH_PROXY_URL = os.getenv("SSH_PROXY_URL", f"http://{_gns3_host}:8022")
+
+
+def format_table(data: List[Dict[str, Any]], columns: List[str]) -> str:
+    """Format list of dicts as simple text table
+
+    Args:
+        data: List of dictionaries containing data
+        columns: List of column names to include in output
+
+    Returns:
+        Formatted table string with "simple" style (no borders)
+    """
+    if not data:
+        return "No items found"
+
+    # Extract specified columns from each dict
+    rows = [[item.get(col, "") for col in columns] for item in data]
+    return tabulate(rows, headers=columns, tablefmt="simple")
+
+
+async def list_console_sessions_impl(app: "IAppContext", project_id: str | None = None) -> str:
+    """
+    List all active console sessions (optionally filtered by project)
+
+    Resource URIs:
+    - projects://{project_id}/sessions/console/ (filtered by project)
+    - sessions://console/?project_id={id} (filtered by project)
+    - sessions://console/ (all sessions)
+
+    Args:
+        project_id: Optional project ID to filter sessions by. If None, returns all sessions.
+
+    Returns:
+        Formatted text table of console session information for project nodes (or all if no filter)
+    """
+    try:
+        # If project_id provided, get nodes in the project to filter sessions
+        if project_id:
+            nodes_data = await app.gns3.get_nodes(project_id)
+            project_node_names = {node["name"] for node in nodes_data}
+        else:
+            project_node_names = None  # No filtering
+
+        # Build sessions list (filtered or all)
+        sessions = []
+        for node_name, session_info in app.console.sessions.items():
+            # Include session if: no filter OR node is in project
+            if project_node_names is None or node_name in project_node_names:
+                sessions.append(
+                    {
+                        "node_name": node_name,
+                        "connected": session_info.connected,
+                        "host": session_info.host,
+                        "port": session_info.port,
+                        "buffer_size": len(session_info.buffer),
+                        "created_at": (
+                            session_info.created_at.isoformat() if session_info.created_at else None
+                        ),
+                    }
+                )
+
+        return format_table(
+            sessions,
+            columns=["node_name", "connected", "host", "port", "buffer_size", "created_at"],
+        )
+    except Exception as e:
+        return f"Error: Failed to list console sessions\nDetails: {str(e)}"
+
+
+async def get_console_session_impl(app: "IAppContext", node_name: str) -> str:
+    """
+    Get console session status for a specific node
+
+    Resource URI: gns3://sessions/console/{node_name}
+
+    Args:
+        node_name: Name of the node
+
+    Returns:
+        JSON object with console session status
+    """
+    try:
+        session_info = app.console.sessions.get(node_name)
+
+        if not session_info:
+            return json.dumps(
+                {
+                    "connected": False,
+                    "node_name": node_name,
+                    "session_id": None,
+                    "host": None,
+                    "port": None,
+                    "buffer_size": 0,
+                    "created_at": None,
+                },
+                indent=2,
+            )
+
+        return json.dumps(
+            {
+                "connected": session_info.connected,
+                "node_name": node_name,
+                "session_id": session_info.session_id,
+                "host": session_info.host,
+                "port": session_info.port,
+                "buffer_size": len(session_info.buffer),
+                "created_at": (
+                    session_info.created_at.isoformat() if session_info.created_at else None
+                ),
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps(
+            {"error": "Failed to get console session", "node_name": node_name, "details": str(e)},
+            indent=2,
+        )
+
+
+async def list_ssh_sessions_impl(app: "IAppContext", project_id: str | None = None) -> str:
+    """
+    List all active SSH sessions (optionally filtered by project) (Multi-Proxy Aggregation v0.26.0)
+
+    Queries all proxies (host + discovered lab proxies) and aggregates sessions.
+
+    Resource URIs:
+    - projects://{project_id}/sessions/ssh/ (filtered by project)
+    - sessions://ssh/?project_id={id} (filtered by project)
+    - sessions://ssh/ (all sessions)
+
+    Args:
+        project_id: Optional project ID to filter sessions by. If None, returns all sessions.
+
+    Returns:
+        Formatted text table of SSH session information with proxy details for each session
+    """
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            # If project_id provided, get nodes in the project to filter sessions
+            if project_id:
+                nodes_data = await app.gns3.get_nodes(project_id)
+                project_node_names = {node["name"] for node in nodes_data}
+            else:
+                project_node_names = None  # No filtering
+
+            # Collect proxy URLs to query: host + lab proxies
+            proxy_urls = [
+                {"url": SSH_PROXY_URL, "proxy_id": "host", "hostname": "Host", "type": "host"}
+            ]
+
+            # Discover lab proxies (optionally filter to project)
+            try:
+                registry_response = await client.get(f"{SSH_PROXY_URL}/proxy/registry")
+                if registry_response.status_code == 200:
+                    registry_data = registry_response.json()
+                    lab_proxies = registry_data.get("proxies", [])
+
+                    # Include lab proxies (filter to project if specified)
+                    for proxy in lab_proxies:
+                        if project_id is None or proxy.get("project_id") == project_id:
+                            # Fix localhost URLs
+                            proxy_url = proxy.get("url")
+                            if proxy_url.startswith("http://localhost:"):
+                                port = proxy_url.split(":")[-1]
+                                proxy_url = f"http://{_gns3_host}:{port}"
+
+                            proxy_urls.append(
+                                {
+                                    "url": proxy_url,
+                                    "proxy_id": proxy.get("proxy_id"),
+                                    "hostname": proxy.get("hostname"),
+                                    "type": "gns3_internal",
+                                }
+                            )
+            except Exception:
+                # Continue with just host proxy if lab proxy discovery fails
+                pass
+
+            # Query each proxy for sessions
+            sessions = []
+            for proxy_info in proxy_urls:
+                proxy_url = proxy_info["url"]
+                proxy_id = proxy_info["proxy_id"]
+                proxy_hostname = proxy_info["hostname"]
+                proxy_type = proxy_info["type"]
+
+                # Get all sessions from this proxy
+                try:
+                    response = await client.get(f"{proxy_url}/ssh/sessions")
+                    if response.status_code == 200:
+                        proxy_sessions = response.json()
+
+                        # Filter to project nodes (if filter specified) and add proxy info
+                        for session in proxy_sessions:
+                            # Include session if: no filter OR node is in project
+                            if (
+                                project_node_names is None
+                                or session.get("node_name") in project_node_names
+                            ):
+                                session["proxy_id"] = proxy_id
+                                session["proxy_hostname"] = proxy_hostname
+                                session["proxy_type"] = proxy_type
+                                sessions.append(session)
+                except Exception:
+                    # Skip proxies that fail
+                    continue
+
+            return format_table(
+                sessions,
+                columns=["node_name", "connected", "proxy_hostname", "proxy_type", "last_command"],
+            )
+
+        except Exception as e:
+            return f"Error: Failed to list SSH sessions\nDetails: {str(e)}\nSuggestion: Ensure SSH proxy service is running"
+
+
+async def get_ssh_session_impl(app: "IAppContext", node_name: str) -> str:
+    """
+    Get SSH session status for a specific node (Multi-Proxy Aware v0.26.0)
+
+    Routes to the correct proxy based on stored proxy mapping.
+
+    Resource URI: gns3://sessions/ssh/{node_name}
+
+    Args:
+        node_name: Name of the node
+
+    Returns:
+        JSON object with SSH session status and proxy info
+    """
+    # Get proxy URL for this node (defaults to host if not in mapping)
+    proxy_url = app.ssh_proxy_mapping.get(node_name, SSH_PROXY_URL)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.get(f"{proxy_url}/ssh/status/{node_name}")
+
+            if response.status_code == 200:
+                result = response.json()
+                # Add proxy info to response
+                result["proxy_url"] = proxy_url
+                return json.dumps(result, indent=2)
+            else:
+                # Should not happen, but handle gracefully
+                return json.dumps(
+                    {
+                        "connected": False,
+                        "node_name": node_name,
+                        "proxy_url": proxy_url,
+                        "error": "Status check failed",
+                    },
+                    indent=2,
+                )
+
+        except Exception as e:
+            return json.dumps(
+                {
+                    "error": "Failed to get SSH session status",
+                    "node_name": node_name,
+                    "proxy_url": proxy_url,
+                    "details": str(e),
+                },
+                indent=2,
+            )
+
+
+async def get_ssh_history_impl(
+    app: "IAppContext", node_name: str, limit: int = 50, search: str | None = None
+) -> str:
+    """
+    Get SSH command history for a specific node (Multi-Proxy Aware v0.26.0)
+
+    Routes to the correct proxy based on stored proxy mapping.
+
+    Resource URI: gns3://sessions/ssh/{node_name}/history
+
+    Args:
+        node_name: Name of the node
+        limit: Maximum number of commands to return (default: 50)
+        search: Optional search filter for command text
+
+    Returns:
+        JSON object with command history and proxy info
+    """
+    # Get proxy URL for this node (defaults to host if not in mapping)
+    proxy_url = app.ssh_proxy_mapping.get(node_name, SSH_PROXY_URL)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            params = {"limit": limit}
+            if search:
+                params["search"] = search
+
+            response = await client.get(f"{proxy_url}/ssh/history/{node_name}", params=params)
+
+            if response.status_code == 200:
+                result = response.json()
+                result["proxy_url"] = proxy_url
+                return json.dumps(result, indent=2)
+            else:
+                error_data = response.json()
+                return json.dumps(
+                    {
+                        "error": error_data.get("detail", {}).get(
+                            "error", "History retrieval failed"
+                        ),
+                        "details": error_data.get("detail", {}).get("details"),
+                        "proxy_url": proxy_url,
+                    },
+                    indent=2,
+                )
+
+        except Exception as e:
+            return json.dumps(
+                {
+                    "error": "Failed to get SSH command history",
+                    "node_name": node_name,
+                    "proxy_url": proxy_url,
+                    "details": str(e),
+                },
+                indent=2,
+            )
+
+
+async def get_ssh_buffer_impl(
+    app: "IAppContext", node_name: str, mode: str = "diff", pages: int = 1
+) -> str:
+    """
+    Get SSH continuous buffer for a specific node (Multi-Proxy Aware v0.26.0)
+
+    Routes to the correct proxy based on stored proxy mapping.
+
+    Resource URI: gns3://sessions/ssh/{node_name}/buffer
+
+    Args:
+        node_name: Name of the node
+        mode: Output mode (diff/last_page/num_pages/all)
+        pages: Number of pages for num_pages mode
+
+    Returns:
+        JSON object with buffer output and proxy info
+    """
+    # Get proxy URL for this node (defaults to host if not in mapping)
+    proxy_url = app.ssh_proxy_mapping.get(node_name, SSH_PROXY_URL)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.get(
+                f"{proxy_url}/ssh/buffer/{node_name}", params={"mode": mode, "pages": pages}
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                result["proxy_url"] = proxy_url
+                return json.dumps(result, indent=2)
+            else:
+                error_data = response.json()
+                return json.dumps(
+                    {
+                        "error": error_data.get("detail", {}).get("error", "Buffer read failed"),
+                        "details": error_data.get("detail", {}).get("details"),
+                        "proxy_url": proxy_url,
+                    },
+                    indent=2,
+                )
+
+        except Exception as e:
+            return json.dumps(
+                {
+                    "error": "Failed to read SSH buffer",
+                    "node_name": node_name,
+                    "proxy_url": proxy_url,
+                    "details": str(e),
+                },
+                indent=2,
+            )
+
+
+async def get_proxy_status_impl(app: "IAppContext") -> str:
+    """
+    Get SSH proxy service status
+
+    Resource URI: gns3://proxy/status
+
+    Returns:
+        JSON object with proxy service status
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            response = await client.get(f"{SSH_PROXY_URL}/health")
+
+            if response.status_code == 200:
+                data = response.json()
+                return json.dumps(
+                    {
+                        "status": "running",
+                        "url": SSH_PROXY_URL,
+                        "version": data.get("version", "unknown"),
+                        "health": "healthy",
+                    },
+                    indent=2,
+                )
+            else:
+                return json.dumps(
+                    {
+                        "status": "unhealthy",
+                        "url": SSH_PROXY_URL,
+                        "error": "Non-200 response from health check",
+                    },
+                    indent=2,
+                )
+
+        except Exception as e:
+            return json.dumps(
+                {
+                    "status": "unreachable",
+                    "url": SSH_PROXY_URL,
+                    "error": str(e),
+                    "suggestion": "Ensure SSH proxy service is running: docker ps | grep gns3-ssh-proxy",
+                },
+                indent=2,
+            )
+
+
+async def get_proxy_registry_impl(app: "IAppContext") -> str:
+    """
+    Get proxy registry (host proxy + discovered lab proxies via Docker API)
+
+    Resource URI: proxies://
+
+    Returns:
+        Formatted text table with all proxy information including:
+        - Host proxy (always present)
+        - Lab proxies (if available)
+        - Type field: "host" or "gns3_internal"
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            # Build host proxy entry (always present)
+            host_proxy = {
+                "proxy_id": "host",
+                "hostname": "Host",
+                "url": SSH_PROXY_URL,
+                "type": "host",
+            }
+
+            # Try to get lab proxies from registry
+            lab_proxies = []
+            try:
+                response = await client.get(f"{SSH_PROXY_URL}/proxy/registry")
+                if response.status_code == 200:
+                    data = response.json()
+                    lab_proxies = data.get("proxies", [])
+                    # Add type field to lab proxies
+                    for proxy in lab_proxies:
+                        proxy["type"] = "gns3_internal"
+            except Exception:
+                # Continue with just host proxy if registry unavailable
+                pass
+
+            # Combine host + lab proxies
+            all_proxies = [host_proxy] + lab_proxies
+
+            return format_table(all_proxies, columns=["proxy_id", "hostname", "type", "url"])
+
+        except Exception as e:
+            # Return just host proxy on error
+            host_proxy = {
+                "proxy_id": "host",
+                "hostname": "Host",
+                "url": SSH_PROXY_URL,
+                "type": "host",
+            }
+            return format_table([host_proxy], columns=["proxy_id", "hostname", "type", "url"])
+
+
+async def list_proxy_sessions_impl(app: "IAppContext") -> str:
+    """
+    List all SSH sessions across all proxies (Multi-Proxy Aggregation v0.26.0)
+
+    Queries host proxy + all discovered lab proxies and aggregates sessions.
+    Unlike list_ssh_sessions_impl, this returns ALL sessions (not filtered by project).
+
+    Resource URI: gns3://proxy/sessions
+
+    Returns:
+        Formatted text table of all SSH sessions with proxy details
+    """
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            # Collect proxy URLs to query: host + lab proxies
+            proxy_urls = [
+                {"url": SSH_PROXY_URL, "proxy_id": "host", "hostname": "Host", "type": "host"}
+            ]
+
+            # Discover all lab proxies
+            try:
+                registry_response = await client.get(f"{SSH_PROXY_URL}/proxy/registry")
+                if registry_response.status_code == 200:
+                    registry_data = registry_response.json()
+                    lab_proxies = registry_data.get("proxies", [])
+
+                    for proxy in lab_proxies:
+                        # Fix localhost URLs
+                        proxy_url = proxy.get("url")
+                        if proxy_url.startswith("http://localhost:"):
+                            port = proxy_url.split(":")[-1]
+                            proxy_url = f"http://{_gns3_host}:{port}"
+
+                        proxy_urls.append(
+                            {
+                                "url": proxy_url,
+                                "proxy_id": proxy.get("proxy_id"),
+                                "hostname": proxy.get("hostname"),
+                                "project_id": proxy.get("project_id"),
+                                "type": "gns3_internal",
+                            }
+                        )
+            except Exception:
+                # Continue with just host proxy if lab proxy discovery fails
+                pass
+
+            # Query each proxy for all sessions
+            sessions = []
+            for proxy_info in proxy_urls:
+                proxy_url = proxy_info["url"]
+                proxy_id = proxy_info["proxy_id"]
+                proxy_hostname = proxy_info["hostname"]
+                proxy_type = proxy_info["type"]
+
+                # Get all sessions from this proxy
+                try:
+                    response = await client.get(f"{proxy_url}/ssh/sessions")
+                    if response.status_code == 200:
+                        proxy_sessions = response.json()
+
+                        # Add proxy info to each session
+                        for session in proxy_sessions:
+                            session["proxy_id"] = proxy_id
+                            session["proxy_hostname"] = proxy_hostname
+                            session["proxy_type"] = proxy_type
+                            if "project_id" in proxy_info:
+                                session["proxy_project_id"] = proxy_info["project_id"]
+                            sessions.append(session)
+                except Exception:
+                    # Skip proxies that fail
+                    continue
+
+            return format_table(
+                sessions,
+                columns=["node_name", "connected", "proxy_hostname", "proxy_type", "last_command"],
+            )
+
+        except Exception as e:
+            return f"Error: Failed to list proxy sessions\nDetails: {str(e)}\nSuggestion: Ensure SSH proxy service is running"
+
+
+async def list_project_proxies_impl(app: "IAppContext", project_id: str) -> str:
+    """
+    List proxies for specific project (template-style resource)
+
+    Resource URI: projects://{project_id}/proxies
+
+    Returns:
+        JSON array of proxy summaries for the specified project
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            response = await client.get(f"{SSH_PROXY_URL}/proxy/registry")
+
+            if response.status_code == 200:
+                data = response.json()
+                proxies = data.get("proxies", [])
+
+                # Filter proxies by project_id
+                project_proxies = [p for p in proxies if p.get("project_id") == project_id]
+                return json.dumps(project_proxies, indent=2)
+            else:
+                return json.dumps([], indent=2)
+
+        except Exception:
+            return json.dumps([], indent=2)
+
+
+async def get_proxy_impl(app: "IAppContext", proxy_id: str) -> str:
+    """
+    Get specific proxy details by proxy_id
+
+    Resource URI: gns3://proxy/{proxy_id}
+
+    Args:
+        proxy_id: GNS3 node_id of the proxy
+
+    Returns:
+        JSON object with full proxy details
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            response = await client.get(f"{SSH_PROXY_URL}/proxy/registry")
+
+            if response.status_code == 200:
+                data = response.json()
+                proxies = data.get("proxies", [])
+
+                # Find proxy by proxy_id
+                for proxy in proxies:
+                    if proxy.get("proxy_id") == proxy_id:
+                        return json.dumps(proxy, indent=2)
+
+                # Proxy not found
+                return create_error_response(
+                    error=f"Proxy not found: {proxy_id}",
+                    error_code=ErrorCode.PROXY_NOT_FOUND,
+                    details="The specified proxy_id does not exist in the registry",
+                    suggested_action="Check available proxies with gns3://proxies resource",
+                    context={
+                        "proxy_id": proxy_id,
+                        "available_proxies": [p.get("proxy_id") for p in proxies],
+                    },
+                )
+            else:
+                return create_error_response(
+                    error="Failed to fetch proxy registry",
+                    error_code=ErrorCode.PROXY_SERVICE_UNREACHABLE,
+                    details=f"HTTP {response.status_code} from proxy registry endpoint",
+                    suggested_action="Ensure SSH proxy service is running on port 8022",
+                )
+
+        except Exception as e:
+            return create_error_response(
+                error="Failed to communicate with proxy service",
+                error_code=ErrorCode.PROXY_SERVICE_UNREACHABLE,
+                details=str(e),
+                suggested_action="Ensure SSH proxy service is running with Docker socket mounted",
+            )

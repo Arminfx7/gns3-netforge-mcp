@@ -1,0 +1,431 @@
+"""Console Session Manager
+
+Manages telnet connections to GNS3 node consoles.
+Supports multiple concurrent sessions with output buffering and diff tracking.
+"""
+
+import asyncio
+import logging
+import re
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Dict
+
+import telnetlib3
+from interfaces import IConsoleManager
+
+logger = logging.getLogger(__name__)
+
+# ANSI escape sequence pattern
+ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI escape codes and normalize line endings"""
+    # Remove ANSI escape codes
+    text = ANSI_ESCAPE.sub("", text)
+
+    # Normalize line endings: convert \r\n and \r to \n
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Remove excessive blank lines (more than 2 consecutive newlines)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text
+
+
+MAX_BUFFER_SIZE = 10 * 1024 * 1024  # 10MB per session
+SESSION_TIMEOUT = 1800  # 30 minutes
+
+
+@dataclass
+class ConsoleSession:
+    """Represents an active console session"""
+
+    session_id: str
+    host: str
+    port: int
+    node_name: str
+    node_id: str = ""  # GNS3 node UUID - used to detect stale sessions after node recreation
+    reader: asyncio.StreamReader | None = None
+    writer: asyncio.StreamWriter | None = None
+    buffer: str = ""
+    read_position: int = 0
+    accessed_terminal: bool = False  # Track if terminal has been read at least once
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    last_activity: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def update_activity(self):
+        """Update last activity timestamp"""
+        self.last_activity = datetime.now(timezone.utc)
+
+    def is_expired(self) -> bool:
+        """Check if session has expired"""
+        age = (datetime.now(timezone.utc) - self.last_activity).total_seconds()
+        return age > SESSION_TIMEOUT
+
+
+class ConsoleManager(IConsoleManager):
+    """Manages multiple console sessions
+
+    Thread-safe management of telnet console connections with automatic
+    output buffering and session tracking.
+    """
+
+    def __init__(self):
+        self.sessions: Dict[str, ConsoleSession] = {}  # session_id → ConsoleSession
+        self._readers: Dict[str, asyncio.Task] = {}  # session_id → reader task
+        self._node_sessions: Dict[str, str] = {}  # node_name → session_id
+        self._lock = asyncio.Lock()  # Protect shared state from race conditions
+
+    async def connect(self, host: str, port: int, node_name: str, node_id: str = "") -> str:
+        """Connect to a console and return session ID
+
+        Thread-safe. If already connected to this node, returns existing session ID.
+        Detects stale sessions when node_id changes (node deleted and recreated with same name).
+
+        Args:
+            host: Console host (GNS3 server IP)
+            port: Console port number
+            node_name: Name of the node for logging
+            node_id: GNS3 node UUID - used to detect stale sessions after node recreation
+
+        Returns:
+            session_id: Unique session identifier
+        """
+        async with self._lock:
+            # Check if already connected
+            if node_name in self._node_sessions:
+                existing_id = self._node_sessions[node_name]
+                if existing_id in self.sessions:
+                    existing_session = self.sessions[existing_id]
+                    # Detect stale session: node_id changed means node was recreated
+                    if node_id and existing_session.node_id and node_id != existing_session.node_id:
+                        logger.warning(
+                            f"Stale session detected for {node_name}: "
+                            f"cached node_id={existing_session.node_id}, "
+                            f"current node_id={node_id}. Reconnecting."
+                        )
+                        # Disconnect stale session (release lock first to avoid deadlock)
+                        stale_id = existing_id
+                    else:
+                        logger.debug(f"Reusing existing session for {node_name}: {existing_id}")
+                        return existing_id
+                else:
+                    stale_id = None
+            else:
+                stale_id = None
+
+            session_id = str(uuid.uuid4())
+
+        # Disconnect stale session outside lock
+        if stale_id:
+            await self.disconnect(stale_id)
+
+        try:
+            # Connect via telnet (outside lock - network I/O)
+            reader, writer = await telnetlib3.open_connection(host, port, encoding="utf-8")
+
+            session = ConsoleSession(
+                session_id=session_id,
+                host=host,
+                port=port,
+                node_name=node_name,
+                node_id=node_id,
+                reader=reader,
+                writer=writer,
+            )
+
+            async with self._lock:
+                # Double-check node_name mapping (another connection might have completed)
+                if node_name in self._node_sessions:
+                    existing_id = self._node_sessions[node_name]
+                    if existing_id in self.sessions:
+                        # Another connection won the race - close this one and return existing
+                        writer.close()
+                        await writer.wait_closed()
+                        logger.debug(
+                            f"Race condition detected for {node_name}, using existing session"
+                        )
+                        return existing_id
+
+                # Store session
+                self.sessions[session_id] = session
+                self._node_sessions[node_name] = session_id
+
+            # Start background task to read console output (outside lock)
+            self._readers[session_id] = asyncio.create_task(self._read_console(session))
+
+            logger.info(
+                f"Connected to {node_name} console at {host}:{port} (session: {session_id})"
+            )
+            return session_id
+
+        except Exception as e:
+            logger.error(f"Failed to connect to {node_name} console: {e}")
+            raise
+
+    async def _read_console(self, session: ConsoleSession):
+        """Background task to continuously read console output"""
+        try:
+            while session.reader and not session.reader.at_eof():
+                data = await session.reader.read(4096)
+                if data:
+                    session.buffer += data
+                    session.update_activity()
+
+                    # Trim buffer if it exceeds max size
+                    if len(session.buffer) > MAX_BUFFER_SIZE:
+                        trim_size = MAX_BUFFER_SIZE // 2
+                        session.buffer = session.buffer[-trim_size:]
+                        # Adjust read position
+                        if session.read_position > trim_size:
+                            session.read_position = 0
+
+                await asyncio.sleep(0.01)  # Small delay to prevent busy waiting
+
+        except Exception as e:
+            logger.error(f"Error reading console for {session.node_name}: {e}")
+
+    async def send(self, session_id: str, data: str) -> bool:
+        """Send data to console
+
+        Args:
+            session_id: Session identifier
+            data: Data to send (command or keystrokes)
+
+        Returns:
+            bool: Success status
+        """
+        session = self.sessions.get(session_id)
+        if not session or not session.writer:
+            logger.error(f"Session {session_id} not found or not connected")
+            return False
+
+        try:
+            # Send data as-is - telnetlib3 handles line endings
+            session.writer.write(data)
+            await session.writer.drain()
+            session.update_activity()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send to console: {e}")
+            return False
+
+    def get_output(self, session_id: str) -> str | None:
+        """Get current console output buffer
+
+        Args:
+            session_id: Session identifier
+
+        Returns:
+            Full console buffer (ANSI codes stripped) or None if session not found
+        """
+        session = self.sessions.get(session_id)
+        if session:
+            session.update_activity()
+            session.accessed_terminal = True  # Mark terminal as accessed
+            return strip_ansi(session.buffer)
+        return None
+
+    def get_diff(self, session_id: str) -> str | None:
+        """Get new console output since last read
+
+        Args:
+            session_id: Session identifier
+
+        Returns:
+            New output since last read (ANSI codes stripped), or None if session not found
+        """
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+
+        new_data = session.buffer[session.read_position :]
+        session.read_position = len(session.buffer)
+        session.update_activity()
+        session.accessed_terminal = True  # Mark terminal as accessed
+        return strip_ansi(new_data)
+
+    def has_accessed_terminal(self, session_id: str) -> bool:
+        """Check if terminal has been accessed (read) at least once
+
+        Args:
+            session_id: Session identifier
+
+        Returns:
+            True if terminal has been read, False otherwise or if session not found
+        """
+        session = self.sessions.get(session_id)
+        return session.accessed_terminal if session else False
+
+    def has_accessed_terminal_by_node(self, node_name: str) -> bool:
+        """Check if terminal has been accessed (read) at least once by node name
+
+        Args:
+            node_name: Name of the node
+
+        Returns:
+            True if terminal has been read, False otherwise or if session not found
+        """
+        session_id = self._node_sessions.get(node_name)
+        if not session_id:
+            return False
+        return self.has_accessed_terminal(session_id)
+
+    async def disconnect(self, session_id: str) -> bool:
+        """Disconnect console session
+
+        Args:
+            session_id: Session identifier
+
+        Returns:
+            bool: Success status
+        """
+        session = self.sessions.get(session_id)
+        if not session:
+            return False
+
+        try:
+            # Cancel reader task
+            if session_id in self._readers:
+                self._readers[session_id].cancel()
+                try:
+                    await self._readers[session_id]
+                except asyncio.CancelledError:
+                    pass
+                del self._readers[session_id]
+
+            # Close writer
+            if session.writer:
+                session.writer.close()
+                await session.writer.wait_closed()
+
+            # Clean up mappings
+            del self.sessions[session_id]
+            # Remove node_name mapping if it exists
+            if session.node_name in self._node_sessions:
+                if self._node_sessions[session.node_name] == session_id:
+                    del self._node_sessions[session.node_name]
+
+            logger.info(f"Disconnected session {session_id} for {session.node_name}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error disconnecting session: {e}")
+            return False
+
+    async def cleanup_expired(self):
+        """Remove expired sessions"""
+        expired = [sid for sid, s in self.sessions.items() if s.is_expired()]
+        for session_id in expired:
+            await self.disconnect(session_id)
+            logger.info(f"Cleaned up expired session {session_id}")
+
+    async def close_all(self):
+        """Close all console sessions"""
+        session_ids = list(self.sessions.keys())
+        for session_id in session_ids:
+            await self.disconnect(session_id)
+
+    def list_sessions(self) -> Dict[str, Dict[str, any]]:
+        """List all active sessions
+
+        Returns:
+            Dict of session info keyed by session_id
+        """
+        return {
+            sid: {
+                "node_name": s.node_name,
+                "host": s.host,
+                "port": s.port,
+                "created_at": s.created_at.isoformat(),
+                "buffer_size": len(s.buffer),
+            }
+            for sid, s in self.sessions.items()
+        }
+
+    # Node-name based convenience methods
+
+    def get_session_id(self, node_name: str) -> str | None:
+        """Get session ID for a node
+
+        Args:
+            node_name: Node name
+
+        Returns:
+            session_id or None if not found
+        """
+        return self._node_sessions.get(node_name)
+
+    def has_session(self, node_name: str) -> bool:
+        """Check if a session exists for a node
+
+        Args:
+            node_name: Node name
+
+        Returns:
+            True if session exists and is active
+        """
+        session_id = self._node_sessions.get(node_name)
+        if not session_id:
+            return False
+        return session_id in self.sessions
+
+    async def send_by_node(self, node_name: str, data: str) -> bool:
+        """Send data to console by node name
+
+        Args:
+            node_name: Node name
+            data: Data to send
+
+        Returns:
+            Success status
+        """
+        session_id = self.get_session_id(node_name)
+        if not session_id:
+            return False
+        return await self.send(session_id, data)
+
+    def get_output_by_node(self, node_name: str) -> str | None:
+        """Get console output by node name
+
+        Args:
+            node_name: Node name
+
+        Returns:
+            Console buffer or None
+        """
+        session_id = self.get_session_id(node_name)
+        if not session_id:
+            return None
+        return self.get_output(session_id)
+
+    def get_diff_by_node(self, node_name: str) -> str | None:
+        """Get new console output by node name
+
+        Args:
+            node_name: Node name
+
+        Returns:
+            New output since last read or None
+        """
+        session_id = self.get_session_id(node_name)
+        if not session_id:
+            return None
+        return self.get_diff(session_id)
+
+    async def disconnect_by_node(self, node_name: str) -> bool:
+        """Disconnect console by node name
+
+        Args:
+            node_name: Node name
+
+        Returns:
+            Success status
+        """
+        session_id = self.get_session_id(node_name)
+        if not session_id:
+            return False
+        return await self.disconnect(session_id)

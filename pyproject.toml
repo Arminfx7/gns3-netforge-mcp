@@ -1,0 +1,154 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gns3-mcp"
+version = "0.54.2"
+description = "GNS3 lab automation MCP server with AI agent integration"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    {name = "Sergei Chistokhin", email = "Sergei@Chistokhin.com"}
+]
+keywords = ["gns3", "mcp", "network", "automation", "ai", "claude", "fastmcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Networking",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "fastmcp>=2.13.0.2",
+    "fastapi>=0.115.0",
+    "httpx>=0.28.1",
+    "telnetlib3>=2.0.8",
+    "pydantic>=2.12.3",
+    "python-dotenv>=1.2.1",
+    "cairosvg>=2.8.2",
+    "docker>=7.1.0",
+    "tabulate>=0.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
+    "pytest-mock>=3.15.1",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.14.2",
+    "mypy>=1.18.2",
+    "black>=25.9.0",
+    "pre-commit>=4.3.0",
+]
+http = [
+    "uvicorn>=0.30.0",
+]
+
+[project.scripts]
+gns3-mcp = "gns3_mcp.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ChistokhinSV/gns3-mcp"
+Documentation = "https://github.com/ChistokhinSV/gns3-mcp#readme"
+Repository = "https://github.com/ChistokhinSV/gns3-mcp"
+Issues = "https://github.com/ChistokhinSV/gns3-mcp/issues"
+Changelog = "https://github.com/ChistokhinSV/gns3-mcp/blob/master/CHANGELOG.md"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gns3_mcp*"]
+exclude = ["tests*", "mcp-server*", "skill*", "ssh-proxy*", "docs*", "data*", ".github*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+# Exclude generated and vendored code
+exclude = [
+    ".git",
+    "__pycache__",
+    "mcp-server/lib",
+    "*.egg-info",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+]
+
+ignore = [
+    "E501",  # line too long (let Black handle)
+    "E701",  # multiple statements on one line (sometimes more readable)
+    "B008",  # do not perform function calls in argument defaults (FastMCP uses this)
+    "B007",  # loop variable not used (intentional in some cases)
+    "B904",  # raise from (not always necessary)
+    "UP035", # typing.Dict vs dict (both acceptable, prefer explicit for clarity)
+    "UP006", # use-pep585-annotation (allow Optional, List for clarity)
+    "UP007", # use-pep604-annotation (allow Optional for clarity)
+    "SIM102", # nested if (sometimes more readable)
+    "SIM105", # contextlib.suppress (prefer explicit try/except)
+    "SIM108", # ternary operator (sometimes less readable)
+    "F841",  # unused variable (may be used for documentation)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # Allow unused imports in __init__.py
+"tests/**/*.py" = ["E402"]  # Allow imports after sys.path manipulation
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = false  # Disabled for lenient mode
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = false  # Disabled for lenient mode
+
+# Start lenient, tighten later
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = false  # Disabled for lenient mode
+
+# Allow missing imports for third-party libs
+ignore_missing_imports = true
+
+# Exclude patterns
+exclude = [
+    'mcp-server/lib/',
+]
+
+# Per-module options
+[[tool.mypy.overrides]]
+module = "mcp.server.lowlevel.*"
+ignore_errors = true
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+skip-string-normalization = false
+exclude = '''
+/(
+    \.git
+  | __pycache__
+  | mcp-server/lib
+  | .*\.egg-info
+)/
+'''
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

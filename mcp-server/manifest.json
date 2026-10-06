@@ -1,0 +1,147 @@
+{
+  "manifest_version": "0.2",
+  "name": "gns3-mcp",
+  "display_name": "GNS3 Lab Controller",
+  "version": "0.54.2",
+  "description": "GNS3 lab automation with AI agent",
+  "long_description": "GNS3 v3 lab automation MCP server with 13 CRUD-style tools. Create/modify nodes, configure via console/SSH, topology management, real-time notifications.",
+  "author": {
+    "name": "Sergei Chistokhin",
+    "email": "Sergei@Chistokhin.com"
+  },
+  "server": {
+    "type": "python",
+    "entry_point": "bootstrap.py",
+    "mcp_config": {
+      "command": "python",
+      "args": [
+        "${__dirname}/bootstrap.py",
+        "--host=${user_config.gns3_host}",
+        "--port=${user_config.gns3_port}",
+        "--username=${user_config.username}",
+        "--password=${user_config.password}"
+      ]
+    }
+  },
+  "user_config": {
+    "gns3_host": {
+      "type": "string",
+      "title": "GNS3 Server Host",
+      "description": "GNS3 server hostname or IP address",
+      "default": "localhost",
+      "required": true
+    },
+    "gns3_port": {
+      "type": "number",
+      "title": "GNS3 Server Port",
+      "description": "GNS3 server API port",
+      "default": 80,
+      "required": true
+    },
+    "username": {
+      "type": "string",
+      "title": "Username",
+      "description": "GNS3 username",
+      "default": "admin",
+      "required": true
+    },
+    "password": {
+      "type": "string",
+      "title": "Password",
+      "description": "GNS3 password",
+      "sensitive": true,
+      "required": true
+    }
+  },
+  "tools": [
+    {
+      "name": "gns3_connection",
+      "description": "CRUD: Manage GNS3 server connection (check status, retry auth, full reconnect with session cleanup). Actions: check, retry, reconnect"
+    },
+    {
+      "name": "project",
+      "description": "CRUD: Manage GNS3 projects (list, open, create, close). Actions: list, open, create, close"
+    },
+    {
+      "name": "node",
+      "description": "CRUD: Manage nodes (list, create, delete, set properties/state). Supports wildcards ('*', 'Router*'), JSON arrays, parallel execution. Actions: list, create, delete, set"
+    },
+    {
+      "name": "link",
+      "description": "CRUD: Manage network connections (list, batch connect/disconnect). Two-phase validation. Actions: list, batch"
+    },
+    {
+      "name": "node_file",
+      "description": "CRUD: Docker node file operations (read, write, configure network). Auto-restarts node for network config. Actions: read, write, configure_network"
+    },
+    {
+      "name": "project_docs",
+      "description": "CRUD: Project documentation (get/update README). Store IP schemes, credentials, architecture notes. Actions: get, update"
+    },
+    {
+      "name": "drawing",
+      "description": "CRUD: Topology drawings (list, create, update, delete, batch). Shapes: rectangle, ellipse, line, text. Actions: list, create, update, delete, batch"
+    },
+    {
+      "name": "console",
+      "description": "Batch console operations (send, read, send_and_wait, keystroke). v0.53.0: Enhanced keystroke (space, repeat, pattern-based, sequences) + pagination handling (--More--). Operations: send, read, send_and_wait, keystroke"
+    },
+    {
+      "name": "ssh",
+      "description": "Batch SSH operations (configure, command, disconnect). Multi-proxy support, auto-recovery (30min TTL). Operations: configure, command, disconnect"
+    },
+    {
+      "name": "notification",
+      "description": "GNS3 event notifications (subscribe, read, unsubscribe, status). Real-time node/link/log events via streaming API. Actions: subscribe, read, unsubscribe, status"
+    },
+    {
+      "name": "query_resource",
+      "description": "Universal resource query tool - access any MCP resource by URI pattern (projects://, nodes://, sessions://, etc.)"
+    },
+    {
+      "name": "search_tools",
+      "description": "Tool discovery - search/filter tools by category (project, node, console, ssh), capability (CRUD, batch, wildcard, parallel), or resource URI"
+    },
+    {
+      "name": "export_topology_diagram",
+      "description": "Export topology diagram as SVG/PNG with optional crop region"
+    }
+  ],
+  "prompts": [
+    {
+      "name": "ssh_setup",
+      "description": "SSH Setup Workflow - Device-specific instructions for configuring SSH on network devices (Cisco IOS, NX-OS, MikroTik, Juniper, Arista, Linux)",
+      "text": "Device-specific SSH configuration workflow for Cisco IOS, NX-OS, MikroTik, Juniper, Arista, and Linux devices"
+    },
+    {
+      "name": "topology_discovery",
+      "description": "Topology Discovery Workflow - Discover and visualize network topology using MCP resources and tools",
+      "text": "Guided workflow for discovering and visualizing network topology using MCP resources and export tools"
+    },
+    {
+      "name": "troubleshooting",
+      "description": "Network Troubleshooting Workflow - OSI model-based systematic troubleshooting for network labs",
+      "text": "OSI model-based systematic troubleshooting methodology for network lab issues"
+    },
+    {
+      "name": "lab_setup",
+      "description": "Lab Setup Workflow - Automated lab topology creation with 6 topology types (star, mesh, linear, ring, OSPF, BGP)",
+      "text": "Automated lab topology creation supporting star, mesh, linear, ring, OSPF, and BGP topologies"
+    },
+    {
+      "name": "node_setup",
+      "description": "Node Setup Workflow - Complete workflow for adding a new node to a lab (create, configure IP, document in README, establish SSH)",
+      "text": "Complete workflow covering: create node from template, start and wait for boot, configure IP address via console, document IP/credentials in project README, and establish SSH session for automation. Supports Cisco IOS, Linux, and MikroTik with device-specific configuration commands."
+    }
+  ],
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ],
+    "runtimes": {
+      "python": ">=3.10"
+    }
+  }
+}

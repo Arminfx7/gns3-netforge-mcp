@@ -1,0 +1,608 @@
+"""GNS3 API client with compatibility for GNS3 2.x and 3.x.
+
+Handles authentication and API interactions with GNS3 server.
+Based on actual traffic analysis from GNS3 v3.0.5.
+"""
+
+import asyncio
+import json
+import logging
+import os
+from datetime import datetime
+from typing import Any, Dict, List
+
+import httpx
+from interfaces import IGns3Client
+
+logger = logging.getLogger(__name__)
+
+
+class GNS3Client(IGns3Client):
+    """Async client for GNS3 v3 API"""
+
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 80,
+        username: str = "admin",
+        password: str = "",
+        use_https: bool = False,
+        verify_ssl: bool = True,
+        api_version: str | None = None,
+    ):
+        """Initialize GNS3 API client
+
+        Args:
+            host: GNS3 server hostname/IP
+            port: GNS3 server port
+            username: GNS3 username
+            password: GNS3 password
+            use_https: Use HTTPS instead of HTTP (default: False)
+            verify_ssl: Verify SSL certificate, set False for self-signed (default: True)
+        """
+        scheme = "https" if use_https else "http"
+        self.base_url = f"{scheme}://{host}:{port}"
+        self.username = username
+        self.password = password
+        # Keep the historical constructor default for callers/tests; the MCP
+        # application explicitly opts into auto-detection below.
+        configured_version = api_version or os.getenv("GNS3_API_VERSION", "3")
+        if configured_version not in {"auto", "2", "3"}:
+            raise ValueError("GNS3_API_VERSION must be 'auto', '2', or '3'")
+        self.api_version = configured_version
+        self.token: str | None = None
+        # Connection status tracking (v0.38.0)
+        self.is_connected: bool = False
+        self.connection_error: str | None = None
+        self.last_auth_attempt: datetime | None = None
+        # Support HTTPS with self-signed certificates (CWE-319 fix)
+        self.client = httpx.AsyncClient(timeout=30.0, verify=verify_ssl)
+
+    @property
+    def api_prefix(self) -> str:
+        """Return the selected controller API prefix."""
+        if self.api_version == "auto":
+            # Requests select the version before authentication is attempted.
+            raise RuntimeError("GNS3 API version has not been detected")
+        return f"/v{self.api_version}"
+
+    async def _detect_api_version(self) -> None:
+        """Detect v2 versus v3 without changing server state.
+
+        A protected endpoint returning 401 still proves that the route exists;
+        a 404 means that API version is not exposed by the server.
+        """
+        if self.api_version != "auto":
+            return
+        for version in ("3", "2"):
+            try:
+                response = await self.client.get(f"{self.base_url}/v{version}/version")
+                if response.status_code != 404:
+                    self.api_version = version
+                    logger.info("Detected GNS3 API v%s at %s", version, self.base_url)
+                    return
+            except httpx.RequestError:
+                continue
+        raise RuntimeError(f"GNS3 API v2/v3 not found at {self.base_url}")
+
+    async def authenticate(
+        self, retry: bool = False, retry_interval: int = 30, max_retries: int | None = None
+    ) -> bool:
+        """Authenticate using GNS3 v2 Basic auth or v3 JWT auth.
+
+        POST /v3/access/users/authenticate
+        Body: {"username": "admin", "password": "password"}
+        Response: {"access_token": "JWT", "token_type": "bearer"}
+
+        Args:
+            retry: If True, retry on failure (default: False)
+            retry_interval: Seconds to wait between retries (default: 30)
+            max_retries: Maximum number of retry attempts, None = infinite (default: None)
+
+        Returns:
+            True if authentication succeeded, False if failed without retry
+        """
+        await self._detect_api_version()
+        if self.api_version == "2":
+            self.client.auth = httpx.BasicAuth(self.username, self.password)
+        attempt = 0
+        while True:
+            attempt += 1
+            self.last_auth_attempt = datetime.now()
+            try:
+                if self.api_version == "2":
+                    response = await self.client.get(
+                        f"{self.base_url}/v2/version",
+                        auth=httpx.BasicAuth(self.username, self.password),
+                    )
+                    response.raise_for_status()
+                    self.token = "basic-auth"
+                else:
+                    response = await self.client.post(
+                        f"{self.base_url}/v3/access/users/authenticate",
+                        json={"username": self.username, "password": self.password},
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    self.token = data["access_token"]
+                # Update connection status on success
+                self.is_connected = True
+                self.connection_error = None
+                if attempt > 1:
+                    logger.info(
+                        f"[{datetime.now().strftime('%H:%M:%S %d.%m.%Y')}] Authentication succeeded on attempt {attempt}"
+                    )
+                else:
+                    logger.info(
+                        f"[{datetime.now().strftime('%H:%M:%S %d.%m.%Y')}] Authenticated to GNS3 server at {self.base_url}"
+                    )
+                return True
+            except Exception as e:
+                # Update connection status on failure
+                self.is_connected = False
+                self.connection_error = self._extract_error(e)
+
+                if not retry or (max_retries is not None and attempt > max_retries):
+                    logger.error(
+                        f"[{datetime.now().strftime('%H:%M:%S %d.%m.%Y')}] Authentication failed: {e}"
+                    )
+                    return False
+
+                # Log retry attempt
+                retry_msg = f"attempt {attempt}"
+                if max_retries is not None:
+                    retry_msg = f"attempt {attempt}/{max_retries}"
+
+                logger.warning(
+                    f"[{datetime.now().strftime('%H:%M:%S %d.%m.%Y')}] Authentication failed ({retry_msg}): {e}"
+                )
+                logger.info(
+                    f"[{datetime.now().strftime('%H:%M:%S %d.%m.%Y')}] Retrying in {retry_interval} seconds..."
+                )
+
+                await asyncio.sleep(retry_interval)
+
+    async def _ensure_authenticated(self) -> None:
+        """Ensure we have a valid token, authenticate if needed
+
+        v0.38.0: Optimized for fast failure (1 retry only)
+        Background authentication task handles reconnection logic
+        """
+        if not self.token:
+            logger.info("No auth token - attempting authentication...")
+            success = await self.authenticate(retry=True, retry_interval=3, max_retries=1)
+            if not success:
+                error_msg = f"GNS3 server unavailable: {self.connection_error} ({self.base_url})"
+                raise RuntimeError(error_msg)
+
+    def _headers(self) -> Dict[str, str]:
+        """Get authentication headers for GNS3 v3; v2 uses per-request Basic auth."""
+        if not self.token:
+            error_msg = f"GNS3 server unavailable or authentication failed ({self.base_url})"
+            if self.connection_error:
+                error_msg = f"GNS3 server unavailable: {self.connection_error} ({self.base_url})"
+            raise RuntimeError(error_msg)
+        if self.api_version == "2":
+            return {}
+        return {"Authorization": f"Bearer {self.token}"}
+
+    def _request_auth(self) -> httpx.BasicAuth | None:
+        return httpx.BasicAuth(self.username, self.password) if self.api_version == "2" else None
+
+    def _extract_error(self, exception: Exception) -> str:
+        """Extract detailed error message from exception
+
+        Args:
+            exception: Exception from httpx
+
+        Returns:
+            Detailed error message
+        """
+        if isinstance(exception, httpx.HTTPStatusError):
+            try:
+                # Try to extract GNS3 API error message
+                error_data = exception.response.json()
+                if isinstance(error_data, dict):
+                    # GNS3 API typically returns {"message": "error details"}
+                    return error_data.get("message", str(exception))
+                return str(exception)
+            except (json.JSONDecodeError, AttributeError):
+                # Fallback to generic message
+                return f"HTTP {exception.response.status_code}: {exception.response.text[:200]}"
+        return str(exception)
+
+    async def get_projects(self) -> List[Dict[str, Any]]:
+        """GET /v3/projects - list all projects"""
+        await self._ensure_authenticated()
+        response = await self.client.get(f"{self.base_url}{self.api_prefix}/projects", headers=self._headers())
+        response.raise_for_status()
+        return response.json()
+
+    async def create_project(self, name: str, path: str | None = None) -> Dict[str, Any]:
+        """POST /v3/projects - create a new project
+
+        Args:
+            name: Project name
+            path: Optional project directory path
+
+        Returns:
+            Created project data
+        """
+        payload = {"name": name}
+        if path:
+            payload["path"] = path
+
+        response = await self.client.post(
+            f"{self.base_url}{self.api_prefix}/projects", headers=self._headers(), json=payload
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def open_project(self, project_id: str) -> Dict[str, Any]:
+        """POST /v3/projects/{id}/open - open a project"""
+        response = await self.client.post(
+            f"{self.base_url}{self.api_prefix}/projects/{project_id}/open", headers=self._headers(), json={}
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def close_project(self, project_id: str) -> Dict[str, Any]:
+        """POST /v3/projects/{id}/close - close a project"""
+        response = await self.client.post(
+            f"{self.base_url}{self.api_prefix}/projects/{project_id}/close", headers=self._headers(), json={}
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def get_snapshots(self, project_id: str) -> List[Dict[str, Any]]:
+        """GET /v3/projects/{id}/snapshots - list all snapshots for a project
+
+        Args:
+            project_id: Project ID
+
+        Returns:
+            List of snapshot data dictionaries
+        """
+        response = await self.client.get(
+            f"{self.base_url}{self.api_prefix}/projects/{project_id}/snapshots", headers=self._headers()
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def get_nodes(self, project_id: str) -> List[Dict[str, Any]]:
+        """GET /v3/projects/{id}/nodes - list all nodes in project"""
+        response = await self.client.get(
+            f"{self.base_url}{self.api_prefix}/projects/{project_id}/nodes", headers=self._headers()
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def get_links(self, project_id: str) -> List[Dict[str, Any]]:
+        """GET /v3/projects/{id}/links - list all links in project"""
+        response = await self.client.get(
+            f"{self.base_url}{self.api_prefix}/projects/{project_id}/links", headers=self._headers()
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def start_node(self, project_id: str, node_id: str) -> Dict[str, Any]:
+        """POST /v3/projects/{id}/nodes/{node_id}/start - start a node"""
+        response = await self.client.post(
+            f"{self.base_url}{self.api_prefix}/projects/{project_id}/nodes/{node_id}/start",
+            headers=self._headers(),
+            json={},
+        )
+        response.raise_for_status()
+        # Handle empty response (204 No Content)
+        if response.status_code == 204 or not response.content:
+            return {}
+        return response.json()
+
+    async def stop_node(self, project_id: str, node_id: str) -> Dict[str, Any]:
+        """POST /v3/projects/{id}/nodes/{node_id}/stop - stop a node"""
+        response = await self.client.post(
+            f"{self.base_url}{self.api_prefix}/projects/{project_id}/nodes/{node_id}/stop",
+            headers=self._headers(),
+            json={},
+        )
+        response.raise_for_status()
+        # Handle empty response (204 No Content)
+        if response.status_code == 204 or not response.content:
+            return {}
+        return response.json()
+
+    async def suspend_node(self, project_id: str, node_id: str) -> Dict[str, Any]:
+        """POST /v3/projects/{id}/nodes/{node_id}/suspend - suspend a node"""
+        response = await self.client.post(
+            f"{self.base_url}{self.api_prefix}/projects/{project_id}/nodes/{node_id}/suspend",
+            headers=self._headers(),
+            json={},
+        )
+        response.raise_for_status()
+        # Handle empty response (204 No Content)
+        if response.status_code == 204 or not response.content:
+            return {}
+        return response.json()
+
+    async def reload_node(self, project_id: str, node_id: str) -> Dict[str, Any]:
+        """POST /v3/projects/{id}/nodes/{node_id}/reload - reload a node"""
+        response = await self.client.post(
+            f"{self.base_url}{self.api_prefix}/projects/{project_id}/nodes/{node_id}/reload",
+            headers=self._headers(),
+            json={},
+        )
+        response.raise_for_status()
+        # Handle empty response (204 No Content)
+        if response.status_code == 204 or not response.content:
+            return {}
+        return response.json()
+
+    async def update_node(
+        self, project_id: str, node_id: str, properties: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """PUT /v3/projects/{id}/nodes/{node_id} - update node properties
+
+        Args:
+            project_id: Project ID
+            node_id: Node ID
+            properties: Dict with properties to update (x, y, z, locked, ports, etc.)
+        """
+        # GNS3 2.x exposes VirtualBox-only fields (notably use_any_adapter)
+        # on the compute endpoint rather than the controller node endpoint.
+        if "use_any_adapter" in properties or "adapter_type" in properties:
+            endpoint = (
+                f"{self.base_url}{self.api_prefix}/compute/projects/{project_id}"
+                f"/virtualbox/nodes/{node_id}"
+            )
+        elif any(key in properties for key in ("slot0", "slot1", "slot2", "wic0", "wic1", "wic2")):
+            endpoint = (
+                f"{self.base_url}{self.api_prefix}/compute/projects/{project_id}"
+                f"/dynamips/nodes/{node_id}"
+            )
+        else:
+            endpoint = f"{self.base_url}{self.api_prefix}/projects/{project_id}/nodes/{node_id}"
+
+        response = await self.client.put(
+            endpoint,
+            headers=self._headers(),
+            json=properties,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def create_link(
+        self, project_id: str, link_spec: Dict[str, Any], timeout: float = 10.0
+    ) -> Dict[str, Any]:
+        """POST /v3/projects/{id}/links - create a new link
+
+        Args:
+            project_id: Project ID
+            link_spec: Link specification with nodes and ports
+            timeout: Operation timeout in seconds
+        """
+        try:
+            response = await self.client.post(
+                f"{self.base_url}{self.api_prefix}/projects/{project_id}/links",
+                headers=self._headers(),
+                json=link_spec,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise RuntimeError(f"Failed to create link: {self._extract_error(e)}") from e
+
+    async def delete_link(self, project_id: str, link_id: str, timeout: float = 10.0) -> None:
+        """DELETE /v3/projects/{id}/links/{link_id} - delete a link
+
+        Args:
+            project_id: Project ID
+            link_id: Link ID to delete
+            timeout: Operation timeout in seconds
+        """
+        try:
+            response = await self.client.delete(
+                f"{self.base_url}{self.api_prefix}/projects/{project_id}/links/{link_id}",
+                headers=self._headers(),
+                timeout=timeout,
+            )
+            response.raise_for_status()
+        except Exception as e:
+            raise RuntimeError(f"Failed to delete link {link_id}: {self._extract_error(e)}") from e
+
+    async def delete_node(self, project_id: str, node_id: str) -> None:
+        """DELETE /v3/projects/{id}/nodes/{node_id} - delete a node"""
+        response = await self.client.delete(
+            f"{self.base_url}{self.api_prefix}/projects/{project_id}/nodes/{node_id}", headers=self._headers()
+        )
+        response.raise_for_status()
+
+    async def get_templates(self) -> List[Dict[str, Any]]:
+        """GET /v3/templates - list all templates"""
+        response = await self.client.get(f"{self.base_url}{self.api_prefix}/templates", headers=self._headers())
+        response.raise_for_status()
+        return response.json()
+
+    async def get_template(self, template_id: str) -> Dict[str, Any]:
+        """GET /v3/templates/{id} - get template details"""
+        response = await self.client.get(
+            f"{self.base_url}{self.api_prefix}/templates/{template_id}", headers=self._headers()
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def create_node_from_template(
+        self, project_id: str, template_id: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """POST /v3/projects/{id}/templates/{template_id} - create node from template"""
+        response = await self.client.post(
+            f"{self.base_url}{self.api_prefix}/projects/{project_id}/templates/{template_id}",
+            headers=self._headers(),
+            json=payload,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def get_drawings(self, project_id: str) -> List[Dict[str, Any]]:
+        """GET /v3/projects/{id}/drawings - list all drawings"""
+        response = await self.client.get(
+            f"{self.base_url}{self.api_prefix}/projects/{project_id}/drawings", headers=self._headers()
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def create_drawing(self, project_id: str, drawing_data: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /v3/projects/{id}/drawings - create a drawing"""
+        response = await self.client.post(
+            f"{self.base_url}{self.api_prefix}/projects/{project_id}/drawings",
+            headers=self._headers(),
+            json=drawing_data,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def update_drawing(
+        self, project_id: str, drawing_id: str, drawing_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """PUT /v3/projects/{id}/drawings/{drawing_id} - update a drawing"""
+        response = await self.client.put(
+            f"{self.base_url}{self.api_prefix}/projects/{project_id}/drawings/{drawing_id}",
+            headers=self._headers(),
+            json=drawing_data,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def delete_drawing(self, project_id: str, drawing_id: str) -> None:
+        """DELETE /v3/projects/{id}/drawings/{drawing_id} - delete a drawing"""
+        response = await self.client.delete(
+            f"{self.base_url}{self.api_prefix}/projects/{project_id}/drawings/{drawing_id}",
+            headers=self._headers(),
+        )
+        response.raise_for_status()
+
+    async def get_node_file(self, project_id: str, node_id: str, file_path: str) -> str:
+        """GET /v3/projects/{id}/nodes/{node_id}/files/{path} - read file from node filesystem
+
+        Args:
+            project_id: Project ID
+            node_id: Node ID
+            file_path: Path relative to container root (e.g., 'etc/network/interfaces')
+
+        Returns:
+            File contents as string
+        """
+        response = await self.client.get(
+            f"{self.base_url}{self.api_prefix}/projects/{project_id}/nodes/{node_id}/files/{file_path}",
+            headers=self._headers(),
+        )
+        response.raise_for_status()
+        return response.text
+
+    async def write_node_file(
+        self, project_id: str, node_id: str, file_path: str, content: str
+    ) -> None:
+        """POST /v3/projects/{id}/nodes/{node_id}/files/{path} - write file to node filesystem
+
+        Args:
+            project_id: Project ID
+            node_id: Node ID
+            file_path: Path relative to container root (e.g., 'etc/network/interfaces')
+            content: File contents to write
+        """
+        response = await self.client.post(
+            f"{self.base_url}{self.api_prefix}/projects/{project_id}/nodes/{node_id}/files/{file_path}",
+            headers={**self._headers(), "Content-Type": "text/plain"},
+            content=content,
+        )
+        response.raise_for_status()
+
+    async def get_version(self) -> Dict[str, Any]:
+        """GET /v3/version - get GNS3 server version"""
+        response = await self.client.get(f"{self.base_url}{self.api_prefix}/version")
+        response.raise_for_status()
+        return response.json()
+
+    async def get_symbol_raw(self, symbol_id: str) -> bytes:
+        """GET /v3/symbols/{symbol_id}/raw - get raw symbol file (PNG/SVG)
+
+        Args:
+            symbol_id: Symbol filename (e.g., 'mikrotik.png')
+
+        Returns:
+            Raw bytes of the symbol file
+        """
+        # URL-encode the symbol_id to handle paths like ':/symbols/...'
+        import urllib.parse
+
+        encoded_symbol = urllib.parse.quote(symbol_id, safe="")
+
+        response = await self.client.get(
+            f"{self.base_url}{self.api_prefix}/symbols/{encoded_symbol}/raw", headers=self._headers()
+        )
+        response.raise_for_status()
+        return response.content
+
+    # Project Files API
+
+    async def get_project_readme(self, project_id: str) -> str:
+        """Get project README/notes
+
+        GET /v3/projects/{project_id}/files/README.txt
+
+        Args:
+            project_id: Project ID
+
+        Returns:
+            README content as string, empty string if doesn't exist
+        """
+        try:
+            response = await self.client.get(
+                f"{self.base_url}{self.api_prefix}/projects/{project_id}/files/README.txt",
+                headers=self._headers(),
+            )
+            if response.status_code == 404:
+                return ""  # README doesn't exist yet
+            response.raise_for_status()
+            return response.text
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return ""
+            logger.error(f"Failed to get README: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error reading README: {e}")
+            raise
+
+    async def update_project_readme(self, project_id: str, content: str) -> bool:
+        """Update project README/notes
+
+        POST /v3/projects/{project_id}/files/README.txt
+
+        Args:
+            project_id: Project ID
+            content: README content to save
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            response = await self.client.post(
+                f"{self.base_url}{self.api_prefix}/projects/{project_id}/files/README.txt",
+                headers=self._headers(),
+                content=content.encode("utf-8"),
+            )
+            return response.status_code == 204
+        except Exception as e:
+            logger.error(f"Failed to update README: {e}")
+            return False
+
+    async def close(self):
+        """Close the HTTP client"""
+        await self.client.aclose()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()

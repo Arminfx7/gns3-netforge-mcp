@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# MCP specific
+# Bundled dependencies (built by Just)
+mcp-server/lib/
+# Copied source code (built by Just)
+mcp-server/gns3_mcp/
+# Note: mcp-server/mcp-server.mcpb is committed (built by pre-commit hook)
+# But ignore any other .mcpb files
+!mcp-server/mcp-server.mcpb
+
+# Project specific - keep data folder but ignore large files
+data/*.pcapng
+
+gns3-gui/
+.coverage
+gns3-project/.coverage
+.claude/settings.local.json
+
+# winsw
+GNS3-MCP-HTTP.exe
+# Service config: tracked as template in git history; runtime copy may contain secrets
+GNS3-MCP-HTTP.xml
+.git.bfg-report/
+
+# Temp files and directories
+DOWNLOAD_TEMP/
+DOWNLOAD_TEMP*/
+
