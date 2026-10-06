@@ -1,6 +1,6 @@
 # GNS3 NetForge MCP
 
-Servidor **Model Context Protocol (MCP)** para automatizar laboratorios de red en GNS3. Permite administrar proyectos, routers, switches, VPCS, máquinas virtuales, enlaces y consolas desde Claude Code, Claude Desktop, Codex u otro cliente compatible con MCP.
+Servidor **Model Context Protocol (MCP)** para automatizar laboratorios de red en GNS3. Permite administrar proyectos, routers, switches, VPCS, máquinas virtuales, enlaces y consolas desde ChatGPT mediante una aplicación MCP personalizada.
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/Protocolo-Model%20Context%20Protocol-6E56CF)](https://modelcontextprotocol.io/)
@@ -39,27 +39,27 @@ Para consultar el flujo completo de creación de laboratorios, revisa [lab_setup
 - Windows 10/11, Linux o macOS.
 - Python 3.10 o superior.
 - GNS3 Server instalado, encendido y accesible.
-- Claude Code, Claude Desktop, Codex u otro cliente MCP.
-- uv o uvx para la instalación recomendada.
+- Una cuenta de ChatGPT con acceso al modo de desarrollador y aplicaciones MCP personalizadas.
+- Un endpoint HTTP/HTTPS accesible por ChatGPT.
 
-## Instalación rápida con uvx
+## Preparar el servidor para ChatGPT
 
-Instala uv:
+Instala las dependencias:
 
 ~~~powershell
-pip install uv
+pip install -e .
 ~~~
 
-Registra el servidor en Claude Code. Cambia los valores por los datos de tu servidor GNS3:
+Inicia el servidor MCP en modo HTTP. Cambia los valores por los datos de tu servidor GNS3:
 
 ~~~powershell
-claude mcp add --transport stdio gns3-mcp --env GNS3_HOST=192.168.1.20 --env GNS3_PORT=80 --env GNS3_USER=admin --env GNS3_PASSWORD=tu-contrasena --scope user -- uvx gns3-mcp@latest
+gns3-mcp --transport http --http-host 0.0.0.0 --http-port 8000
 ~~~
 
-Comprueba la conexión:
+Comprueba el servicio:
 
 ~~~powershell
-claude mcp get gns3-mcp
+curl http://localhost:8000/health
 ~~~
 
 ## Instalación desde el código fuente
@@ -73,11 +73,7 @@ python -m pip install --upgrade pip
 pip install -e .
 ~~~
 
-Después registra el ejecutable local:
-
-~~~powershell
-claude mcp add --transport stdio gns3-mcp --env GNS3_HOST=192.168.1.20 --env GNS3_PORT=80 --env GNS3_USER=admin --env GNS3_PASSWORD=tu-contrasena --scope user -- gns3-mcp
-~~~
+Después inicia el servidor en modo HTTP con el comando indicado en la sección anterior.
 
 ## Variables de configuración
 
@@ -100,9 +96,50 @@ notepad .env
 
 Nunca publiques un archivo .env ni contraseñas reales.
 
-## Configuración en Claude Desktop
+## Configuración en ChatGPT
 
-Agrega el servidor en la configuración MCP:
+ChatGPT utiliza servidores MCP remotos. Si el servidor está en tu computadora o en una red privada, debes publicarlo mediante HTTPS o utilizar un túnel MCP seguro; ChatGPT no se conecta directamente a un servidor local sin ese mecanismo.
+
+En ChatGPT web:
+
+1. Abre **Configuración** y entra a **Aplicaciones** o **Aplicaciones conectadas**.
+2. Activa **Modo de desarrollador** si tu plan y espacio de trabajo lo permiten.
+3. Selecciona **Crear aplicación** o **Crear conector MCP personalizado**.
+4. Escribe un nombre, por ejemplo **GNS3 NetForge MCP**.
+5. Introduce la URL HTTPS de tu servidor MCP, por ejemplo `https://tu-dominio.example/mcp`.
+6. Selecciona el método de autenticación que hayas configurado.
+7. Pulsa **Scan Tools**, verifica las herramientas y selecciona **Create**.
+8. Abre un chat nuevo, selecciona la aplicación MCP desde el menú de herramientas y prueba una solicitud como: “Muestra los proyectos disponibles en GNS3”.
+
+La guía oficial se encuentra en [Modo de desarrollador y aplicaciones MCP en ChatGPT](https://help.openai.com/es-419/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt).
+
+### Variables para el servidor HTTP
+
+~~~powershell
+$env:GNS3_HOST="192.168.1.20"
+$env:GNS3_PORT="80"
+$env:GNS3_USER="admin"
+$env:GNS3_PASSWORD="tu-contrasena"
+gns3-mcp --transport http --http-host 0.0.0.0 --http-port 8000
+~~~
+
+No publiques directamente el puerto sin protección. Usa HTTPS, autenticación y un túnel seguro cuando el servidor se encuentre en una red privada.
+
+## Uso desde ChatGPT
+
+Después de agregar la aplicación MCP, puedes pedirle a ChatGPT:
+
+- “Lista los proyectos de GNS3 disponibles”.
+- “Muestra la topología del proyecto actual”.
+- “Inicia los routers R1 y R2”.
+- “Conecta estos dos dispositivos y verifica el enlace”.
+- “Abre la consola de R1 y ejecuta show ip interface brief”.
+
+Para acciones que cambien la topología o ejecuten comandos, revisa la confirmación que muestre ChatGPT antes de aceptarla.
+
+<!-- La configuración JSON siguiente se conserva como referencia para otros clientes MCP. -->
+
+### Configuración para otros clientes MCP
 
 ~~~json
 {
@@ -121,7 +158,7 @@ Agrega el servidor en la configuración MCP:
 }
 ~~~
 
-Reinicia Claude Desktop después de guardar el archivo.
+Reinicia el cliente MCP después de guardar el archivo.
 
 ## Modo HTTP
 
@@ -176,11 +213,13 @@ Si no conecta con GNS3:
 curl http://192.168.1.20:80/v3/version
 ~~~
 
-Si Claude no muestra el servidor:
+Si ChatGPT no muestra la aplicación MCP:
 
-~~~powershell
-claude mcp get gns3-mcp
-claude mcp list
+~~~text
+1. Verifica que el endpoint HTTPS sea accesible desde Internet o desde el túnel MCP seguro.
+2. Ejecuta nuevamente **Scan Tools** en la configuración de la aplicación.
+3. Comprueba que el servidor responda en `/health`.
+4. Revisa la autenticación y los permisos de las herramientas.
 ~~~
 
 Para problemas con Docker:
