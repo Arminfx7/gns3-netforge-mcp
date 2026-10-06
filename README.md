@@ -4,6 +4,16 @@ Model Context Protocol (MCP) server for GNS3 network lab automation. Control GNS
 
 > Proyecto publicado como **GNS3 NetForge MCP**. Esta copia conserva la base funcional del servidor MCP para automatizar laboratorios de GNS3.
 
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![MCP](https://img.shields.io/badge/Protocol-Model%20Context%20Protocol-6E56CF)](https://modelcontextprotocol.io/)
+[![GNS3](https://img.shields.io/badge/GNS3-Automation-00AEEF)](https://www.gns3.com/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Repository](https://img.shields.io/badge/GitHub-Arminfx7%2Fgns3--netforge--mcp-181717?logo=github)](https://github.com/Arminfx7/gns3-netforge-mcp)
+
+<p align="center">
+  <img src="mcp-server/docs/diagrams/lab_setup_workflow.svg" alt="GNS3 NetForge MCP workflow" width="760">
+</p>
+
 **Version**: 0.49.0
 
 ## Features
@@ -22,6 +32,17 @@ Model Context Protocol (MCP) server for GNS3 network lab automation. Control GNS
 - **Tool Discovery**: `search_tools()` with category/capability/resource filtering
 - **Claude Desktop Support**: All resources accessible via tools (`query_resource`, `list_projects`, `list_nodes`, `get_topology`)
 - **Security**: API key authentication (HTTP mode), service privilege isolation, HTTPS support
+
+## Arquitectura visual
+
+El servidor conecta un cliente compatible con MCP con GNS3 para administrar proyectos, nodos,
+consolas y automatizaciones de red.
+
+<p align="center">
+  <img src="mcp-server/docs/diagrams/topology_discovery_workflow.svg" alt="Topology discovery workflow" width="760">
+</p>
+
+<p align="center"><em>Flujo de descubrimiento y automatización de topologías GNS3.</em></p>
 
 ## Installation
 
