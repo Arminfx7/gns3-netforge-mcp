@@ -11,7 +11,7 @@ Model Context Protocol (MCP) server for GNS3 network lab automation. Control GNS
 [![Repository](https://img.shields.io/badge/GitHub-Arminfx7%2Fgns3--netforge--mcp-181717?logo=github)](https://github.com/Arminfx7/gns3-netforge-mcp)
 
 <p align="center">
-  <img src="mcp-server/docs/diagrams/lab_setup_workflow.svg" alt="GNS3 NetForge MCP workflow" width="760">
+  <img src="docs/assets/gns3-netforge-banner.svg" alt="GNS3 NetForge MCP conectado a una topología GNS3" width="760">
 </p>
 
 **Version**: 0.49.0
@@ -43,6 +43,9 @@ consolas y automatizaciones de red.
 </p>
 
 <p align="center"><em>Flujo de descubrimiento y automatización de topologías GNS3.</em></p>
+
+También puedes consultar el flujo completo de creación de laboratorios en
+[`lab_setup_workflow.svg`](mcp-server/docs/diagrams/lab_setup_workflow.svg).
 
 ## Installation
 
